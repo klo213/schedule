@@ -1,0 +1,79 @@
+base_url: https://app.bookafield.us
+dry_run: true
+log_dir: logs
+timezone: America/Chicago
+resource_map_path: docs/resource_mapping_example.csv
+
+auth:
+  endpoint: /mn/flaaa/frs/Web/index.php
+  # Credentials must NOT be stored here.
+  # Set BOOKAFIELD_USERNAME and BOOKAFIELD_PASSWORD environment variables instead.
+  # In Cloud Run, bind these to Secret Manager secrets: bookafield-username / bookafield-password
+  username: ""
+  password: ""
+  username_field: email
+  password_field: password
+  payload_type: form
+  extra_fields:
+    captcha: login
+    submit: ""
+    resume: ""
+
+csrf:
+  endpoint: ""
+  token_field: CSRF_TOKEN
+  header_name: X-CSRF-Token
+
+reservation:
+  endpoint: /mn/flaaa/frs/Web/ajax/reservation_save.php
+  form_page_base: /mn/flaaa/frs/Web/reservation.php
+  reservation_id_field: referenceNumber
+  payload_type: multipart
+  schedule_id: "3"
+  user_id: "93"
+  event_type_field: psiattribute[1]
+  division_field: psiattribute[3]
+  title_template: "{event_type} {team}"
+  description_template: "{team}"
+  static_form_fields:
+    repeatOptions: none
+    repeatEvery: "1"
+    repeatMonthlyType: dayOfMonth
+    reservationAction: create
+    DELETE_REASON: ""
+    seriesUpdateScope: full
+
+notifications:
+  enabled: true
+  channel: file
+  output_dir: notifications
+
+umpire_assignment:
+  coordinator_email: umpire.coordinator@example.com
+  pending_file: data/pending_umpire_assignments.json
+
+reschedule:
+  max_options: 3
+  candidate_days_ahead: 14
+  practice_start_hours: [17, 18, 19]
+
+coach_request_sync:
+  google_sheet_csv_url: ""
+  output_csv: data/coach_requests_latest.csv
+  state_file: data/coach_request_sync_state.json
+  id_prefix: REQ
+  column_map:
+    coach_name: Coach Full Name
+    coach_email: Coach Email
+    team: Team
+    event_type: Event Type
+    preferred_resource: Preferred Field
+    requested_date: Requested Date
+    requested_start_time: Requested Start Time
+    requested_end_time: Requested End Time
+    needs_umpire: Umpire Required?
+    reason: Reason for change
+
+twilio:
+  umpire_coordinator_numbers:
+    - "+1XXXXXXXXXX"
