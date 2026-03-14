@@ -1,0 +1,39 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Data and logs (never bake into image)
+data/
+logs/
+notifications/
+
+# Archives and uploads
+*.zip
+*.tar.gz
+*.tar
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (belt-and-suspenders — credentials must not be in config anyway)
+*.env
+.env*
+secrets/
