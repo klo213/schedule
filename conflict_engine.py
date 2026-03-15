@@ -1,8 +1,13 @@
 import logging
+from typing import List
 
-def detect_conflicts(row, existing_reservations):
-    # Placeholder for conflict detection logic
-    logging.info(f"Checking for conflicts for row: {row.to_dict()}")
-    # In a real implementation, this function would check the proposed reservation
-    # against a list of existing reservations to see if there are any overlaps.
+logger = logging.getLogger(__name__)
+
+
+def detect_conflicts(rows: List) -> List:
+    """
+    Stub: accepts list of ValidatedRow objects, returns no conflicts.
+    Real overlap-detection logic deferred until after canary success.
+    """
+    logger.info("Conflict check: %d rows, returning 0 conflicts (stub)", len(rows))
     return []
