@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import uuid
+from pathlib import Path
 import pandas as pd
 import yaml
 from http.cookiejar import CookieJar
@@ -31,10 +32,11 @@ class BookaFieldClient:
         self._resource_mapping = self._load_resource_mapping()
         self.authenticate()
     def _load_resource_mapping(self):
+        resource_map_path = Path(str(self._config.get("resource_map_path") or "docs/resource_mapping_example.csv"))
         try:
-            return pd.read_csv("docs/resource_mapping_example.csv", index_col="resource_name")
+            return pd.read_csv(resource_map_path, index_col="resource_name")
         except FileNotFoundError:
-            raise ConfigurationError("Resource mapping file not found at docs/resource_mapping_example.csv")
+            raise ConfigurationError(f"Resource mapping file not found at {resource_map_path}")
     def _resolve_value(self, value: object) -> str:
         raw = str(value or "").strip()
         if raw.startswith("${") and raw.endswith("}"):

@@ -304,7 +304,6 @@ def run_scheduler(schedule_csv_path: Path, config_path: Path, dry_run_override: 
     if not dry_run:
         try:
             api_client = BookaFieldClient(config=config)
-            api_client.authenticate()
         except (AuthenticationError, ConfigurationError, APIError) as exc:
             auth_failure_reason = str(exc)
 
