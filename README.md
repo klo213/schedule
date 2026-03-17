@@ -24,9 +24,10 @@ This job reads a schedule CSV, validates each row, and creates BookaField reserv
 ## Operating Modes
 
 - Canary input example: [`docs/live_canary_single_row.csv`](docs/live_canary_single_row.csv)
+- Default mapped schedule seed: [`docs/schedule_template.csv`](docs/schedule_template.csv)
 - Placeholder input example: `gs://bookafield-schedule-inputs/schedule.csv`
 
-Do not point the deployed job back at `gs://bookafield-schedule-inputs/schedule.csv` until that object contains real mapped BookaField resource names. The current placeholder file uses values such as `DRY_RUN_FIELD_1` and will fail validation by design.
+Do not point the deployed job back at `gs://bookafield-schedule-inputs/schedule.csv` until that object contains real mapped BookaField resource names. The original placeholder file used values such as `DRY_RUN_FIELD_1` and failed validation by design.
 
 ## Recommended Workflow
 
