@@ -59,7 +59,11 @@ def validate_row(
     if end_dt <= start_dt:
         return None, f"Row {row_number}: end_datetime must be after start_datetime"
 
-    resource_id = resource_map.get(resource, resource)
+    resource_id = resource_map.get(resource)
+    if not resource_id:
+        return None, (
+            f"Row {row_number}: resource '{resource}' was not found in the resource map"
+        )
     resource_name = resource
 
     fingerprint = f"{resource_id}|{start_raw}|{end_raw}|{team}"

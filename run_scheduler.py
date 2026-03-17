@@ -344,6 +344,10 @@ def run_scheduler(schedule_csv_path: Path, config_path: Path, dry_run_override: 
                         "Reservation created response did not include reservation id. "
                         f"Body keys: {list(response_body.keys())}"
                     )
+                if response_body.get("_debug_payload_summary") is not None:
+                    attempt["debug_payload_summary"] = response_body.get("_debug_payload_summary")
+                if response_body.get("_debug_response_excerpt"):
+                    attempt["debug_response_excerpt"] = response_body.get("_debug_response_excerpt")
         except (ConfigurationError, APIError) as exc:
             attempt["status"] = "api_failure"
             attempt["api_result"] = "failed"
@@ -368,6 +372,17 @@ def run_scheduler(schedule_csv_path: Path, config_path: Path, dry_run_override: 
 
     log_dir = Path(str(config.get("log_dir") or "logs"))
     _write_audit_outputs(log_dir=log_dir, run_id=run_id, attempts=attempts, summary=summary)
+
+    for a in attempts:
+        if a.get("status") == "api_failure":
+            print(json.dumps({
+                "log_type": "attempt_failure",
+                "row_number": a.get("row_number"),
+                "api_result": a.get("api_result", "unknown"),
+                "failure_reason": a.get("failure_reason", "unknown"),
+                "debug_payload_summary": a.get("debug_payload_summary"),
+                "debug_response_excerpt": a.get("debug_response_excerpt"),
+            }))
 
     return summary
 

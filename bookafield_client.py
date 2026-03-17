@@ -117,6 +117,31 @@ class BookaFieldClient:
             raise APIError(f"HTTP {exc.code} on {method.upper()} {url}: {snippet}") from exc
         except error.URLError as exc:
             raise APIError(f"Network error on {method.upper()} {url}: {exc.reason}") from exc
+    def _debug_payload_summary(self, payload: Dict[str, object]) -> Dict[str, object]:
+        interesting_keys = [
+            "userId",
+            "scheduleId",
+            "resourceId",
+            "beginDate",
+            "beginPeriod",
+            "endDate",
+            "endPeriod",
+            "reservationAction",
+            "reservationTitle",
+            "reservationDescription",
+            "referenceNumber",
+        ]
+        summary = {key: payload.get(key) for key in interesting_keys if key in payload}
+        summary["payload_keys"] = sorted(str(key) for key in payload.keys())
+        return summary
+    def _response_excerpt(self, response_body: Dict[str, object], limit: int = 800) -> str:
+        raw_text = str(response_body.get("raw_text") or "")
+        if not raw_text:
+            return ""
+        compact = re.sub(r"\s+", " ", raw_text).strip()
+        return compact[:limit]
+    def _emit_debug_event(self, log_type: str, **fields: object) -> None:
+        print(json.dumps({"log_type": log_type, **fields}, sort_keys=True))
     def _extract_csrf_from_html(self, html: str, token_field: str) -> Optional[str]:
         input_pattern = rf"<input[^>]*name=[\"\']{re.escape(token_field)}[\"\'][^>]*>"
         for input_match in re.finditer(input_pattern, html, flags=re.IGNORECASE):
@@ -326,25 +351,45 @@ class BookaFieldClient:
         reservation_cfg = self._config.get("reservation") or {}
         if not isinstance(reservation_cfg, dict):
             raise ConfigurationError("reservation must be an object in config")
-        resource_name = payload.get("resource")
-        if resource_name not in self._resource_mapping.index:
-            raise APIError(f"Resource '{resource_name}' not found in resource mapping.")
-        
-        resource_id = self._resource_mapping.loc[resource_name]["resource_id"]
-        # This is a simplified payload for the purpose of the exercise.
-        # The original client has more complex logic to build the payload.
-        api_payload = {
-            "resourceId": resource_id,
-            "title": f"{payload.get('team')} - {payload.get('event_type')}",
-            "beginDate": payload.get("start_datetime").split(" ")[0],
-            "beginPeriod": payload.get("start_datetime").split(" ")[1],
-            "endDate": payload.get("end_datetime").split(" ")[0],
-            "endPeriod": payload.get("end_datetime").split(" ")[1],
-            "scheduleId": 1 # Assuming a default scheduleId
-        }
         endpoint = str(reservation_cfg.get("endpoint") or "").strip()
         if not endpoint:
             raise ConfigurationError("Missing config value: reservation.endpoint")
+
+        resource_id = str(payload.get("resourceId") or "").strip()
+        if not resource_id:
+            resource_name = payload.get("resource")
+            if resource_name not in self._resource_mapping.index:
+                raise APIError(f"Resource '{resource_name}' not found in resource mapping.")
+            resource_id = str(self._resource_mapping.loc[resource_name]["resource_id"]).strip()
+
+        if endpoint.endswith("reservation_save.php"):
+            # Preserve the richer scheduler-built web payload for BookaField form submissions.
+            api_payload = dict(payload)
+            api_payload["resourceId"] = resource_id
+        else:
+            begin_date = str(payload.get("beginDate") or "").strip()
+            begin_period = str(payload.get("beginPeriod") or "").strip()
+            end_date = str(payload.get("endDate") or "").strip()
+            end_period = str(payload.get("endPeriod") or "").strip()
+            if not all([begin_date, begin_period, end_date, end_period]):
+                start_raw = str(payload.get("start_datetime") or "").strip()
+                end_raw = str(payload.get("end_datetime") or "").strip()
+                if start_raw and " " in start_raw and end_raw and " " in end_raw:
+                    begin_date, begin_period = start_raw.split(" ", 1)
+                    end_date, end_period = end_raw.split(" ", 1)
+
+            schedule_id = payload.get("scheduleId") or reservation_cfg.get("schedule_id") or 1
+            reservation_title = payload.get("reservationTitle") or f"{payload.get('team')} - {payload.get('event_type')}"
+
+            api_payload = {
+                "resourceId": resource_id,
+                "title": reservation_title,
+                "beginDate": begin_date,
+                "beginPeriod": begin_period,
+                "endDate": end_date,
+                "endPeriod": end_period,
+                "scheduleId": schedule_id,
+            }
         payload_type = str(reservation_cfg.get("payload_type") or "json").strip().lower()
         if not payload_type:
             if endpoint.endswith("reservation_save.php"):
@@ -377,7 +422,21 @@ class BookaFieldClient:
             referer_endpoint = self._build_form_endpoint_from_payload(api_payload)
             if referer_endpoint:
                 headers.setdefault("Referer", self._compose_url(referer_endpoint))
+        self._emit_debug_event(
+            "bookafield_request",
+            endpoint=endpoint,
+            payload_type=payload_type,
+            payload_summary=self._debug_payload_summary(api_payload),
+            header_keys=sorted(headers.keys()),
+        )
         response = self._request("POST", endpoint, payload=api_payload, headers=headers, payload_type=payload_type)
+        self._emit_debug_event(
+            "bookafield_response",
+            endpoint=endpoint,
+            status_code=response.status_code,
+            body_keys=sorted(str(key) for key in response.body.keys()),
+            response_excerpt=self._response_excerpt(response.body),
+        )
         reservation_id_field = str(reservation_cfg.get("reservation_id_field") or "reservation_id")
         reservation_id = response.body.get(reservation_id_field)
         if reservation_id is None:
@@ -386,6 +445,11 @@ class BookaFieldClient:
                 match = re.search(r"reference number is\s*([A-Za-z0-9]+)", raw_text, flags=re.IGNORECASE)
                 if match:
                     reservation_id = match.group(1)
+        if reservation_id is None:
+            response.body["_debug_payload_summary"] = self._debug_payload_summary(api_payload)
+            excerpt = self._response_excerpt(response.body)
+            if excerpt:
+                response.body["_debug_response_excerpt"] = excerpt
         if reservation_id is None and csrf_error is not None:
             response.body["_csrf_warning"] = str(csrf_error)
         return (str(reservation_id) if reservation_id is not None else None, response.body)

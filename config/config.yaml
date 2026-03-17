@@ -9,8 +9,8 @@ auth:
   # Credentials must NOT be stored here.
   # Set BOOKAFIELD_USERNAME and BOOKAFIELD_PASSWORD environment variables instead.
   # In Cloud Run, bind these to Secret Manager secrets: bookafield-username / bookafield-password
-  username: ""
-  password: ""
+  username: ${BOOKAFIELD_USERNAME}
+  password: ${BOOKAFIELD_PASSWORD}
   username_field: email
   password_field: password
   payload_type: form
