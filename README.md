@@ -46,6 +46,9 @@ The scheduler job is not a webhook target. Inbound coach SMS requests need a sep
 - Output queue: `coach_request_sync.output_csv`
 - Request ID state: `coach_request_sync.state_file`
 - Signature validation: enabled by default via `TWILIO_AUTH_TOKEN`
+- Cloud deployment should override queue/state to durable GCS locations with:
+  - `COACH_REQUEST_OUTPUT_CSV`
+  - `COACH_REQUEST_STATE_FILE`
 
 Expected SMS format uses key/value pairs separated by semicolons, for example:
 

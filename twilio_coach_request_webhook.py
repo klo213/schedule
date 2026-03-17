@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import io
 import json
 import os
 import re
@@ -17,6 +18,11 @@ try:
     import yaml
 except ImportError as exc:
     raise RuntimeError("PyYAML is required. Install with: pip install pyyaml") from exc
+
+try:
+    from google.cloud import storage as gcs_storage
+except ImportError:
+    gcs_storage = None
 
 
 CANONICAL_FIELDS = {
@@ -101,6 +107,14 @@ def _twiml_message(message: str) -> str:
     return f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>{safe}</Message></Response>"
 
 
+def _resolve_config_value(value: object) -> str:
+    raw = str(value or "").strip()
+    if raw.startswith("${") and raw.endswith("}"):
+        env_name = raw[2:-1].strip()
+        return os.environ.get(env_name, "").strip()
+    return raw
+
+
 def _normalize_allowed_numbers(raw_numbers: Iterable[object]) -> set[str]:
     allowed = set()
     for value in raw_numbers:
@@ -113,7 +127,7 @@ def _normalize_allowed_numbers(raw_numbers: Iterable[object]) -> set[str]:
 def _write_inbound_diagnostic(config_path: Path, payload: Dict[str, object]) -> None:
     try:
         config = _load_config(config_path)
-        logs_dir = Path(str(config.get("log_dir") or "logs"))
+        logs_dir = Path(_resolve_config_value(config.get("log_dir") or "logs"))
         logs_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(UTC)
         path = logs_dir / f"twilio_inbound_{now.strftime('%Y%m%d')}.jsonl"
@@ -123,6 +137,97 @@ def _write_inbound_diagnostic(config_path: Path, payload: Dict[str, object]) -> 
             handle.write(json.dumps(row, sort_keys=True) + "\n")
     except Exception:
         return
+
+
+def _is_gcs_uri(value: str) -> bool:
+    return str(value or "").startswith("gs://")
+
+
+def _gcs_blob(uri: str):
+    if gcs_storage is None:
+        raise RuntimeError(
+            "google-cloud-storage is required for GCS persistence. "
+            "Install with: pip install google-cloud-storage"
+        )
+    without_prefix = uri[5:]
+    bucket_name, _, blob_name = without_prefix.partition("/")
+    if not bucket_name or not blob_name:
+        raise ValueError(f"Invalid GCS URI: {uri}")
+    client = gcs_storage.Client()
+    bucket = client.bucket(bucket_name)
+    return bucket.blob(blob_name)
+
+
+def _read_text(location: str) -> Optional[str]:
+    if _is_gcs_uri(location):
+        blob = _gcs_blob(location)
+        if not blob.exists():
+            return None
+        return blob.download_as_text(encoding="utf-8")
+
+    path = Path(location)
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def _write_text(location: str, text: str) -> None:
+    if _is_gcs_uri(location):
+        blob = _gcs_blob(location)
+        blob.upload_from_string(text, content_type="application/json; charset=utf-8")
+        return
+
+    path = Path(location)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _csv_exists(location: str) -> bool:
+    if _is_gcs_uri(location):
+        return bool(_gcs_blob(location).exists())
+    return Path(location).exists()
+
+
+def _append_csv_row_to_location(location: str, row: Dict[str, str]) -> None:
+    existing = _read_text(location) or ""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=OUTPUT_COLUMNS)
+    if not existing.strip():
+        writer.writeheader()
+    else:
+        buffer.write(existing)
+        if existing and not existing.endswith("\n"):
+            buffer.write("\n")
+    writer.writerow({key: row.get(key, "") for key in OUTPUT_COLUMNS})
+
+    if _is_gcs_uri(location):
+        blob = _gcs_blob(location)
+        blob.upload_from_string(buffer.getvalue(), content_type="text/csv; charset=utf-8")
+        return
+
+    path = Path(location)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(buffer.getvalue(), encoding="utf-8", newline="")
+
+
+def _coach_request_output_location(config: Dict[str, object]) -> str:
+    coach_cfg = config.get("coach_request_sync") or {}
+    if not isinstance(coach_cfg, dict):
+        raise ValueError("coach_request_sync must be an object in config")
+    return (
+        os.environ.get("COACH_REQUEST_OUTPUT_CSV", "").strip()
+        or _resolve_config_value(coach_cfg.get("output_csv") or "data/coach_requests_latest.csv")
+    )
+
+
+def _coach_request_state_location(config: Dict[str, object]) -> str:
+    coach_cfg = config.get("coach_request_sync") or {}
+    if not isinstance(coach_cfg, dict):
+        raise ValueError("coach_request_sync must be an object in config")
+    return (
+        os.environ.get("COACH_REQUEST_STATE_FILE", "").strip()
+        or _resolve_config_value(coach_cfg.get("state_file") or "data/coach_request_sync_state.json")
+    )
 
 
 def _parse_key_value_body(body: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
@@ -251,42 +356,32 @@ def parse_coach_request_sms(body: str) -> Tuple[Optional[Dict[str, str]], Option
     return parsed, None
 
 
-def _load_state(state_path: Path) -> Dict[str, object]:
-    if not state_path.exists():
+def _load_state(state_location: str) -> Dict[str, object]:
+    existing = _read_text(state_location)
+    if not existing:
         return {"next_sequence": 1}
-    loaded = json.loads(state_path.read_text(encoding="utf-8"))
+    loaded = json.loads(existing)
     if not isinstance(loaded, dict):
         raise ValueError("Coach request state file must contain a JSON object")
     return loaded
 
 
-def _store_state(state_path: Path, state: Dict[str, object]) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+def _store_state(state_location: str, state: Dict[str, object]) -> None:
+    _write_text(state_location, json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 def _next_request_id(config: Dict[str, object]) -> str:
     coach_cfg = config.get("coach_request_sync") or {}
     if not isinstance(coach_cfg, dict):
         raise ValueError("coach_request_sync must be an object in config")
-    state_path = Path(str(coach_cfg.get("state_file") or "data/coach_request_sync_state.json"))
+    state_location = _coach_request_state_location(config)
     id_prefix = str(coach_cfg.get("id_prefix") or "REQ").strip() or "REQ"
-    state = _load_state(state_path)
+    state = _load_state(state_location)
     next_sequence = int(state.get("next_sequence") or 1)
     request_id = f"{id_prefix}-{next_sequence:04d}"
     state["next_sequence"] = next_sequence + 1
-    _store_state(state_path, state)
+    _store_state(state_location, state)
     return request_id
-
-
-def _append_csv_row(path: Path, row: Dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
-    with path.open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
-        if write_header:
-            writer.writeheader()
-        writer.writerow({key: row.get(key, "") for key in OUTPUT_COLUMNS})
 
 
 def process_incoming_twilio_coach_request(config_path: Path, from_number: str, body: str) -> str:
@@ -321,7 +416,7 @@ def process_incoming_twilio_coach_request(config_path: Path, from_number: str, b
     if not isinstance(coach_cfg, dict):
         raise ValueError("coach_request_sync must be an object in config")
 
-    output_path = Path(str(coach_cfg.get("output_csv") or "data/coach_requests_latest.csv"))
+    output_location = _coach_request_output_location(config)
     request_id = _next_request_id(config)
     now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     record = {
@@ -343,7 +438,7 @@ def process_incoming_twilio_coach_request(config_path: Path, from_number: str, b
         "status": "received",
         "raw_message": body.strip(),
     }
-    _append_csv_row(output_path, record)
+    _append_csv_row_to_location(output_location, record)
     _write_inbound_diagnostic(
         config_path,
         {"from": from_number, "body": body, "result": "accepted", "request_id": request_id, "record": record},
