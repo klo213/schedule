@@ -75,5 +75,8 @@ coach_request_sync:
     reason: Reason for change
 
 twilio:
+  validate_signature: true
+  auth_token_env: TWILIO_AUTH_TOKEN
   umpire_coordinator_numbers:
     - "+1XXXXXXXXXX"
+  coach_request_allowed_numbers: []

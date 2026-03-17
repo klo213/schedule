@@ -1,0 +1,475 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import html
+import json
+import os
+import re
+from datetime import UTC, datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
+
+try:
+    import yaml
+except ImportError as exc:
+    raise RuntimeError("PyYAML is required. Install with: pip install pyyaml") from exc
+
+
+CANONICAL_FIELDS = {
+    "name",
+    "email",
+    "team",
+    "event_type",
+    "date",
+    "start",
+    "end",
+    "field",
+    "umpire",
+    "reason",
+    "opponent",
+    "urgent",
+}
+
+FIELD_ALIASES = {
+    "name": "name",
+    "coach": "name",
+    "coach_name": "name",
+    "email": "email",
+    "coach_email": "email",
+    "team": "team",
+    "event": "event_type",
+    "event_type": "event_type",
+    "type": "event_type",
+    "date": "date",
+    "requested_date": "date",
+    "start": "start",
+    "start_time": "start",
+    "requested_start_time": "start",
+    "end": "end",
+    "end_time": "end",
+    "requested_end_time": "end",
+    "field": "field",
+    "preferred_field": "field",
+    "resource": "field",
+    "umpire": "umpire",
+    "umpire_required": "umpire",
+    "reason": "reason",
+    "notes": "reason",
+    "opponent": "opponent",
+    "opponent_team": "opponent",
+    "urgent": "urgent",
+}
+
+OUTPUT_COLUMNS = [
+    "request_id",
+    "source",
+    "received_at",
+    "coach_name",
+    "coach_phone",
+    "coach_email",
+    "team",
+    "event_type",
+    "opponent_team",
+    "preferred_resource",
+    "preferred_start_datetime",
+    "preferred_end_datetime",
+    "needs_umpire",
+    "urgent",
+    "reason",
+    "status",
+    "raw_message",
+]
+
+REQUIRED_FIELDS = {"name", "email", "team", "event_type", "date", "start", "end", "field", "umpire", "reason"}
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _load_config(config_path: Path) -> Dict[str, object]:
+    with config_path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError("Config root must be a mapping/object")
+    return loaded
+
+
+def _twiml_message(message: str) -> str:
+    safe = html.escape(message)
+    return f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>{safe}</Message></Response>"
+
+
+def _normalize_allowed_numbers(raw_numbers: Iterable[object]) -> set[str]:
+    allowed = set()
+    for value in raw_numbers:
+        raw = str(value or "").strip()
+        if raw:
+            allowed.add(raw)
+    return allowed
+
+
+def _write_inbound_diagnostic(config_path: Path, payload: Dict[str, object]) -> None:
+    try:
+        config = _load_config(config_path)
+        logs_dir = Path(str(config.get("log_dir") or "logs"))
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(UTC)
+        path = logs_dir / f"twilio_inbound_{now.strftime('%Y%m%d')}.jsonl"
+        row = dict(payload)
+        row["timestamp"] = now.isoformat().replace("+00:00", "Z")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:
+        return
+
+
+def _parse_key_value_body(body: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    text = (body or "").strip()
+    if not text:
+        return None, "Empty message."
+
+    raw_segments = []
+    for chunk in text.replace("\r", "\n").split("\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        raw_segments.extend(part.strip() for part in chunk.split(";") if part.strip())
+
+    parsed: Dict[str, str] = {}
+    unknown_keys: List[str] = []
+    for segment in raw_segments:
+        if ":" in segment:
+            key, value = segment.split(":", 1)
+        elif "=" in segment:
+            key, value = segment.split("=", 1)
+        else:
+            return None, (
+                "Invalid format. Use key:value pairs separated by semicolons. "
+                "Example: name:Jane Coach; email:jane@example.com; team:12U Black; "
+                "event:Game; date:2026-05-10; start:18:00; end:20:00; field:Fenway 1; "
+                "umpire:yes; reason:Weather makeup"
+            )
+
+        normalized_key = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
+        canonical = FIELD_ALIASES.get(normalized_key)
+        if not canonical:
+            unknown_keys.append(key.strip())
+            continue
+
+        parsed[canonical] = value.strip()
+
+    if unknown_keys:
+        return None, f"Unknown field(s): {', '.join(unknown_keys)}"
+
+    missing = [field for field in sorted(REQUIRED_FIELDS) if not parsed.get(field)]
+    if missing:
+        return None, f"Missing required field(s): {', '.join(missing)}"
+
+    return parsed, None
+
+
+def _parse_date(value: str) -> datetime:
+    formats = ["%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except ValueError:
+            continue
+    raise ValueError("Use date as YYYY-MM-DD or MM/DD/YYYY")
+
+
+def _parse_time(value: str) -> datetime:
+    formats = ["%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M%p"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except ValueError:
+            continue
+    raise ValueError("Use time as HH:MM or h:MM AM/PM")
+
+
+def _normalize_yes_no(value: str, *, default: str = "No") -> str:
+    lowered = str(value or "").strip().lower()
+    if not lowered:
+        return default
+    if lowered in {"yes", "y", "true", "1"}:
+        return "Yes"
+    if lowered in {"no", "n", "false", "0"}:
+        return "No"
+    raise ValueError(f"Use Yes/No for value '{value}'")
+
+
+def parse_coach_request_sms(body: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    fields, error = _parse_key_value_body(body)
+    if error:
+        return None, error
+    assert fields is not None
+
+    email = fields["email"].strip()
+    if not EMAIL_PATTERN.match(email):
+        return None, "Invalid email format."
+
+    try:
+        requested_date = _parse_date(fields["date"])
+        requested_start = _parse_time(fields["start"])
+        requested_end = _parse_time(fields["end"])
+        needs_umpire = _normalize_yes_no(fields["umpire"])
+        urgent = _normalize_yes_no(fields.get("urgent") or "", default="No")
+    except ValueError as exc:
+        return None, str(exc)
+
+    start_dt = requested_date.replace(
+        hour=requested_start.hour,
+        minute=requested_start.minute,
+        second=0,
+        microsecond=0,
+    )
+    end_dt = requested_date.replace(
+        hour=requested_end.hour,
+        minute=requested_end.minute,
+        second=0,
+        microsecond=0,
+    )
+    if end_dt <= start_dt:
+        return None, "End time must be after start time."
+
+    parsed = {
+        "coach_name": fields["name"].strip(),
+        "coach_email": email,
+        "team": fields["team"].strip(),
+        "event_type": fields["event_type"].strip(),
+        "opponent_team": fields.get("opponent", "").strip(),
+        "preferred_resource": fields["field"].strip(),
+        "preferred_start_datetime": start_dt.strftime("%Y-%m-%d %H:%M"),
+        "preferred_end_datetime": end_dt.strftime("%Y-%m-%d %H:%M"),
+        "needs_umpire": needs_umpire,
+        "urgent": urgent,
+        "reason": fields["reason"].strip(),
+    }
+    return parsed, None
+
+
+def _load_state(state_path: Path) -> Dict[str, object]:
+    if not state_path.exists():
+        return {"next_sequence": 1}
+    loaded = json.loads(state_path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError("Coach request state file must contain a JSON object")
+    return loaded
+
+
+def _store_state(state_path: Path, state: Dict[str, object]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _next_request_id(config: Dict[str, object]) -> str:
+    coach_cfg = config.get("coach_request_sync") or {}
+    if not isinstance(coach_cfg, dict):
+        raise ValueError("coach_request_sync must be an object in config")
+    state_path = Path(str(coach_cfg.get("state_file") or "data/coach_request_sync_state.json"))
+    id_prefix = str(coach_cfg.get("id_prefix") or "REQ").strip() or "REQ"
+    state = _load_state(state_path)
+    next_sequence = int(state.get("next_sequence") or 1)
+    request_id = f"{id_prefix}-{next_sequence:04d}"
+    state["next_sequence"] = next_sequence + 1
+    _store_state(state_path, state)
+    return request_id
+
+
+def _append_csv_row(path: Path, row: Dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in OUTPUT_COLUMNS})
+
+
+def process_incoming_twilio_coach_request(config_path: Path, from_number: str, body: str) -> str:
+    config = _load_config(config_path)
+    twilio_cfg = config.get("twilio") or {}
+    if twilio_cfg and not isinstance(twilio_cfg, dict):
+        raise ValueError("twilio must be an object in config")
+
+    allowed_numbers = _normalize_allowed_numbers((twilio_cfg or {}).get("coach_request_allowed_numbers") or [])
+    if allowed_numbers and from_number not in allowed_numbers:
+        message = "This number is not authorized for coach request intake."
+        _write_inbound_diagnostic(
+            config_path,
+            {"from": from_number, "body": body, "result": "unauthorized_number", "message": message},
+        )
+        return message
+
+    parsed, error = parse_coach_request_sms(body)
+    if error:
+        _write_inbound_diagnostic(
+            config_path,
+            {"from": from_number, "body": body, "result": "parse_error", "message": error},
+        )
+        return (
+            f"{error} Reply with: "
+            "name:...; email:...; team:...; event:Game; date:YYYY-MM-DD; start:18:00; end:20:00; "
+            "field:...; umpire:yes/no; reason:..."
+        )
+    assert parsed is not None
+
+    coach_cfg = config.get("coach_request_sync") or {}
+    if not isinstance(coach_cfg, dict):
+        raise ValueError("coach_request_sync must be an object in config")
+
+    output_path = Path(str(coach_cfg.get("output_csv") or "data/coach_requests_latest.csv"))
+    request_id = _next_request_id(config)
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    record = {
+        "request_id": request_id,
+        "source": f"twilio:{from_number}",
+        "received_at": now,
+        "coach_name": parsed["coach_name"],
+        "coach_phone": from_number,
+        "coach_email": parsed["coach_email"],
+        "team": parsed["team"],
+        "event_type": parsed["event_type"],
+        "opponent_team": parsed["opponent_team"],
+        "preferred_resource": parsed["preferred_resource"],
+        "preferred_start_datetime": parsed["preferred_start_datetime"],
+        "preferred_end_datetime": parsed["preferred_end_datetime"],
+        "needs_umpire": parsed["needs_umpire"],
+        "urgent": parsed["urgent"],
+        "reason": parsed["reason"],
+        "status": "received",
+        "raw_message": body.strip(),
+    }
+    _append_csv_row(output_path, record)
+    _write_inbound_diagnostic(
+        config_path,
+        {"from": from_number, "body": body, "result": "accepted", "request_id": request_id, "record": record},
+    )
+
+    return (
+        f"Received {request_id} for {parsed['team']} on {parsed['preferred_start_datetime']} at "
+        f"{parsed['preferred_resource']}. We will review it shortly."
+    )
+
+
+def _request_url(handler: BaseHTTPRequestHandler) -> str:
+    parsed = urlparse(handler.path)
+    proto = handler.headers.get("X-Forwarded-Proto") or "http"
+    host = handler.headers.get("Host") or "localhost"
+    if parsed.query:
+        return f"{proto}://{host}{parsed.path}?{parsed.query}"
+    return f"{proto}://{host}{parsed.path}"
+
+
+def _validate_twilio_signature(config_path: Path, handler: BaseHTTPRequestHandler, form: Dict[str, List[str]]) -> bool:
+    config = _load_config(config_path)
+    twilio_cfg = config.get("twilio") or {}
+    if twilio_cfg and not isinstance(twilio_cfg, dict):
+        raise ValueError("twilio must be an object in config")
+    validate_signature = bool((twilio_cfg or {}).get("validate_signature", True))
+    auth_token_env = str((twilio_cfg or {}).get("auth_token_env") or "TWILIO_AUTH_TOKEN").strip() or "TWILIO_AUTH_TOKEN"
+    if not validate_signature:
+        return True
+
+    auth_token = os.environ.get(auth_token_env, "").strip()
+    if not auth_token:
+        raise ValueError(f"Missing Twilio auth token env var: {auth_token_env}")
+
+    signature = handler.headers.get("X-Twilio-Signature", "").strip()
+    if not signature:
+        return False
+
+    try:
+        from twilio.request_validator import RequestValidator
+    except ImportError as exc:
+        raise RuntimeError("twilio is required. Install with: pip install twilio") from exc
+
+    payload = {key: values[0] if values else "" for key, values in form.items()}
+    validator = RequestValidator(auth_token)
+    return bool(validator.validate(_request_url(handler), payload, signature))
+
+
+class TwilioCoachRequestWebhookHandler(BaseHTTPRequestHandler):
+    config_path: Path
+    endpoint_path: str
+
+    def _write_xml(self, status: HTTPStatus, body: str) -> None:
+        payload = body.encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", "application/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path != self.endpoint_path:
+            self._write_xml(HTTPStatus.NOT_FOUND, _twiml_message("Unknown endpoint."))
+            return
+
+        content_length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(content_length).decode("utf-8", errors="replace")
+        form = parse_qs(raw)
+
+        try:
+            if not _validate_twilio_signature(self.config_path, self, form):
+                self._write_xml(HTTPStatus.FORBIDDEN, _twiml_message("Invalid Twilio signature."))
+                return
+        except Exception as exc:
+            self._write_xml(HTTPStatus.INTERNAL_SERVER_ERROR, _twiml_message(f"Signature validation failed: {exc}"))
+            return
+
+        from_number = (form.get("From") or [""])[0].strip()
+        message_body = (form.get("Body") or [""])[0].strip()
+
+        try:
+            message = process_incoming_twilio_coach_request(
+                config_path=self.config_path,
+                from_number=from_number,
+                body=message_body,
+            )
+            self._write_xml(HTTPStatus.OK, _twiml_message(message))
+        except Exception as exc:  # pragma: no cover
+            self._write_xml(HTTPStatus.INTERNAL_SERVER_ERROR, _twiml_message(f"Server error: {exc}"))
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        payload = {
+            "service": "twilio_coach_request_webhook",
+            "status": "ok",
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "endpoint": self.endpoint_path,
+        }
+        self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+
+def run_server(config_path: Path, host: str, port: int, endpoint_path: str) -> None:
+    TwilioCoachRequestWebhookHandler.config_path = config_path
+    TwilioCoachRequestWebhookHandler.endpoint_path = endpoint_path
+    server = ThreadingHTTPServer((host, port), TwilioCoachRequestWebhookHandler)
+    print(f"Twilio coach request webhook listening on http://{host}:{port}{endpoint_path}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Twilio webhook for coach change requests")
+    parser.add_argument("--config", type=Path, default=Path("config/config.yaml"), help="Path to config YAML")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
+    parser.add_argument("--port", type=int, default=8080, help="Port to bind")
+    parser.add_argument("--path", default="/twilio/coach-request", help="Webhook path")
+    args = parser.parse_args()
+    run_server(config_path=args.config, host=args.host, port=args.port, endpoint_path=args.path)
+
+
+if __name__ == "__main__":
+    main()

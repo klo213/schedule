@@ -6,3 +6,4 @@ google-cloud-secret-manager>=2.16.0
 google-cloud-storage>=2.10.0
 anthropic[vertex]>=0.40.0
 google-auth>=2.27.0
+twilio>=9.6.0

@@ -36,3 +36,19 @@ Do not point the deployed job back at `gs://bookafield-schedule-inputs/schedule.
 3. Run a dry-run execution and verify the summary/logs.
 4. Run a one-off live execution only after the dry-run is clean.
 5. Review Cloud Run stdout logs for summary, `attempt_failure`, and BookaField request/response events.
+
+## Twilio Coach Requests
+
+The scheduler job is not a webhook target. Inbound coach SMS requests need a separate always-on service built from [`Dockerfile.twilio-webhook`](Dockerfile.twilio-webhook).
+
+- Webhook path: `/twilio/coach-request`
+- Runtime: [`twilio_coach_request_webhook.py`](twilio_coach_request_webhook.py)
+- Output queue: `coach_request_sync.output_csv`
+- Request ID state: `coach_request_sync.state_file`
+- Signature validation: enabled by default via `TWILIO_AUTH_TOKEN`
+
+Expected SMS format uses key/value pairs separated by semicolons, for example:
+
+`name:Jane Coach; email:jane@example.com; team:12U Black; event:Game; date:2026-05-10; start:18:00; end:20:00; field:Fenway 1; umpire:yes; urgent:no; reason:Weather makeup`
+
+Accepted requests are normalized into the coach request queue with a generated `REQ-XXXX` ID and a TwiML confirmation response.
