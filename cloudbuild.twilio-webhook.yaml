@@ -1,0 +1,11 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.twilio-webhook
+      - -t
+      - us-central1-docker.pkg.dev/project-ff5e2433-0b1b-4841-b97/scheduler/twilio-coach-request-webhook:20260317a
+      - .
+images:
+  - us-central1-docker.pkg.dev/project-ff5e2433-0b1b-4841-b97/scheduler/twilio-coach-request-webhook:20260317a
