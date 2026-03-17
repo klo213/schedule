@@ -92,6 +92,7 @@ OUTPUT_COLUMNS = [
 
 REQUIRED_FIELDS = {"name", "email", "team", "event_type", "date", "start", "end", "field", "umpire", "reason"}
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+REQUEST_ID_PATTERN = re.compile(r"\b(REQ-[A-Za-z0-9_-]+)\b", flags=re.IGNORECASE)
 
 
 def _load_config(config_path: Path) -> Dict[str, object]:
@@ -227,6 +228,16 @@ def _coach_request_state_location(config: Dict[str, object]) -> str:
     return (
         os.environ.get("COACH_REQUEST_STATE_FILE", "").strip()
         or _resolve_config_value(coach_cfg.get("state_file") or "data/coach_request_sync_state.json")
+    )
+
+
+def _pending_umpire_assignments_location(config: Dict[str, object]) -> str:
+    umpire_cfg = config.get("umpire_assignment") or {}
+    if not isinstance(umpire_cfg, dict):
+        raise ValueError("umpire_assignment must be an object in config")
+    return (
+        os.environ.get("PENDING_UMPIRE_ASSIGNMENTS_FILE", "").strip()
+        or _resolve_config_value(umpire_cfg.get("pending_file") or "data/pending_umpire_assignments.json")
     )
 
 
@@ -450,6 +461,140 @@ def process_incoming_twilio_coach_request(config_path: Path, from_number: str, b
     )
 
 
+def parse_umpire_sms_command(body: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    text = " ".join((body or "").strip().split())
+    if not text:
+        return None, None, None, "Empty message. Include request ID and status."
+
+    request_match = REQUEST_ID_PATTERN.search(text)
+    if not request_match:
+        return None, None, None, "Missing request ID. Example: REQ-123 Looking"
+    request_id = request_match.group(1).upper()
+
+    lowered = text.lower()
+    decision: Optional[str] = None
+    if "looking" in lowered or "search" in lowered or "pending" in lowered:
+        decision = "looking_for_umpire_assignment"
+    elif "assigned" in lowered:
+        decision = "umpire_assigned"
+
+    if not decision:
+        return request_id, None, None, "Missing decision. Use 'Umpire Assigned' or 'Looking for umpire assignment'."
+
+    assigned_name: Optional[str] = None
+    if decision == "umpire_assigned":
+        assigned_match = re.search(
+            r"(?:umpire\s+assigned|assigned)\s*[:\-]?\s*(.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if assigned_match:
+            candidate = assigned_match.group(1).strip()
+            if candidate and not REQUEST_ID_PATTERN.search(candidate):
+                assigned_name = candidate
+
+    return request_id, decision, assigned_name, None
+
+
+def _load_pending_assignments(config: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+    location = _pending_umpire_assignments_location(config)
+    payload = _read_text(location)
+    if not payload:
+        return {}
+    loaded = json.loads(payload)
+    if not isinstance(loaded, list):
+        return {}
+    pending: Dict[str, Dict[str, object]] = {}
+    for row in loaded:
+        if not isinstance(row, dict):
+            continue
+        request_id = str(row.get("request_id") or "").strip()
+        if request_id:
+            pending[request_id] = row
+    return pending
+
+
+def _store_pending_assignments(config: Dict[str, object], pending: Dict[str, Dict[str, object]]) -> None:
+    location = _pending_umpire_assignments_location(config)
+    rows = sorted(pending.values(), key=lambda item: str(item.get("request_id") or ""))
+    _write_text(location, json.dumps(rows, indent=2, sort_keys=True) + "\n")
+
+
+def process_incoming_twilio_umpire_reply(config_path: Path, from_number: str, body: str) -> str:
+    config = _load_config(config_path)
+    twilio_cfg = config.get("twilio") or {}
+    if twilio_cfg and not isinstance(twilio_cfg, dict):
+        raise ValueError("twilio must be an object in config")
+
+    allowed_numbers = _normalize_allowed_numbers((twilio_cfg or {}).get("umpire_coordinator_numbers") or [])
+    if allowed_numbers and from_number not in allowed_numbers:
+        message = "This number is not authorized for umpire coordinator updates."
+        _write_inbound_diagnostic(
+            config_path,
+            {"from": from_number, "body": body, "result": "unauthorized_umpire_number", "message": message},
+        )
+        return message
+
+    request_id, decision, assigned_name, parse_error = parse_umpire_sms_command(body)
+    if parse_error:
+        _write_inbound_diagnostic(
+            config_path,
+            {
+                "from": from_number,
+                "body": body,
+                "request_id": request_id,
+                "result": "umpire_parse_error",
+                "message": parse_error,
+            },
+        )
+        return parse_error
+
+    pending = _load_pending_assignments(config)
+    pending_row = pending.get(request_id or "")
+    if not pending_row:
+        message = f"Update not applied for {request_id}: Not found in pending assignments"
+        _write_inbound_diagnostic(
+            config_path,
+            {"from": from_number, "body": body, "request_id": request_id, "result": "umpire_unmatched", "message": message},
+        )
+        return message
+
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    pending_row["last_coordinator_response"] = body.strip()
+    pending_row["last_coordinator_response_at"] = now_iso
+    pending_row["responded_by"] = from_number
+
+    if decision == "umpire_assigned":
+        if not assigned_name:
+            return "assigned_umpire_name is required when response is assigned"
+        pending_row["status"] = "complete"
+        pending_row["assigned_umpire_name"] = assigned_name
+        pending_row["assigned_at"] = now_iso
+        pending_row["assigned_by"] = from_number
+        pending_row["umpire_assignment_status"] = "umpire_assigned"
+        message = f"Received. {request_id} marked complete with umpire assigned."
+    else:
+        pending_row["status"] = "pending_umpire_assignment"
+        pending_row["umpire_assignment_status"] = "looking_for_umpire_assignment"
+        message = f"Received. {request_id} remains pending while umpire assignment is in progress."
+
+    pending[request_id or ""] = pending_row
+    _store_pending_assignments(config, pending)
+    _write_inbound_diagnostic(
+        config_path,
+        {
+            "from": from_number,
+            "body": body,
+            "request_id": request_id,
+            "decision": decision,
+            "assigned_umpire_name": assigned_name,
+            "result": "umpire_updated",
+            "message": message,
+        },
+    )
+    return message
+
+
 def _request_url(handler: BaseHTTPRequestHandler) -> str:
     parsed = urlparse(handler.path)
     proto = handler.headers.get("X-Forwarded-Proto") or "http"
@@ -489,7 +634,6 @@ def _validate_twilio_signature(config_path: Path, handler: BaseHTTPRequestHandle
 
 class TwilioCoachRequestWebhookHandler(BaseHTTPRequestHandler):
     config_path: Path
-    endpoint_path: str
 
     def _write_xml(self, status: HTTPStatus, body: str) -> None:
         payload = body.encode("utf-8")
@@ -501,7 +645,7 @@ class TwilioCoachRequestWebhookHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path != self.endpoint_path:
+        if parsed.path not in {"/twilio/coach-request", "/twilio/umpire-reply"}:
             self._write_xml(HTTPStatus.NOT_FOUND, _twiml_message("Unknown endpoint."))
             return
 
@@ -521,11 +665,18 @@ class TwilioCoachRequestWebhookHandler(BaseHTTPRequestHandler):
         message_body = (form.get("Body") or [""])[0].strip()
 
         try:
-            message = process_incoming_twilio_coach_request(
-                config_path=self.config_path,
-                from_number=from_number,
-                body=message_body,
-            )
+            if parsed.path == "/twilio/umpire-reply":
+                message = process_incoming_twilio_umpire_reply(
+                    config_path=self.config_path,
+                    from_number=from_number,
+                    body=message_body,
+                )
+            else:
+                message = process_incoming_twilio_coach_request(
+                    config_path=self.config_path,
+                    from_number=from_number,
+                    body=message_body,
+                )
             self._write_xml(HTTPStatus.OK, _twiml_message(message))
         except Exception as exc:  # pragma: no cover
             self._write_xml(HTTPStatus.INTERNAL_SERVER_ERROR, _twiml_message(f"Server error: {exc}"))
@@ -538,16 +689,15 @@ class TwilioCoachRequestWebhookHandler(BaseHTTPRequestHandler):
             "service": "twilio_coach_request_webhook",
             "status": "ok",
             "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "endpoint": self.endpoint_path,
+            "endpoint": parsed.path,
         }
         self.wfile.write(json.dumps(payload).encode("utf-8"))
 
 
 def run_server(config_path: Path, host: str, port: int, endpoint_path: str) -> None:
     TwilioCoachRequestWebhookHandler.config_path = config_path
-    TwilioCoachRequestWebhookHandler.endpoint_path = endpoint_path
     server = ThreadingHTTPServer((host, port), TwilioCoachRequestWebhookHandler)
-    print(f"Twilio coach request webhook listening on http://{host}:{port}{endpoint_path}")
+    print(f"Twilio webhook service listening on http://{host}:{port}{endpoint_path}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
